@@ -261,17 +261,6 @@ static void test_parse()
 
 int main()
 {
-#ifdef _WINDOWS
-    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
-#endif
-#if 1
-    test_parse();
-    printf("%d/%d (%3.2f%%) passed\n", test_pass, test_count, test_pass * 100.0 / test_count);
-    return main_ret;
-#endif
 
-#if 0
-    char str[] = "sdasd";
-    printf("%d", sizeof(str));
-#endif
+    printf("sb");
 }
