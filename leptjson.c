@@ -256,10 +256,12 @@ static int lept_parse_string(lept_context *c, lept_value *v)
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
                     if (*p++ != 'u')
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
+                    //此时判断遍历后面的低位项，判断是否在要求的范围中
                     if (!(p = lept_parse_hex4(p, &u2)))
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
                     if (u2 < 0xDC00 || u2 > 0xDFFF)
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
+                    //计算最终码点
                     u = (((u - 0xD800) << 10) | (u2 - 0xDC00)) + 0x10000;
                 }
                 lept_encode_utf8(c, u);
@@ -393,6 +395,7 @@ void lept_set_string(lept_value *v, const char *s, size_t len)
 //该函数用于读取输入字符串中前四位字符用于判断是否是十六进制数，0~FFFF
 //同时将Unique Code中16进制数字转化成10进制数字比如00A2对应的就是162
 // 002A
+//同时该函数最大的特点就是可以将十六进制字符串转化为十进制数字
 static const char *lept_parse_hex4(const char *p, unsigned *u)
 {
     int i;
@@ -413,6 +416,7 @@ static const char *lept_parse_hex4(const char *p, unsigned *u)
     }
     return p;
 }
+
 static void lept_encode_utf8(lept_context *c, unsigned u)
 {
     if (u <= 0x7F)

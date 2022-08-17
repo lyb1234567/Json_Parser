@@ -261,6 +261,9 @@ static void test_parse()
 
 int main()
 {
-
-    printf("sb");
+#if 1
+    unsigned u = 0b0010;
+    unsigned c = u & 0xFF;
+    printf("%u", u);
+#endif
 }
