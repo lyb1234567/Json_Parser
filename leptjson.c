@@ -8,11 +8,16 @@
 #include <math.h>   /* HUGE_VAL */
 #include <stdlib.h> /* NULL, malloc(), realloc(), free(), strtod() */
 #include <string.h> /* memcpy() */
-
 #ifndef LEPT_PARSE_STACK_INIT_SIZE
 #define LEPT_PARSE_STACK_INIT_SIZE 256
 #endif
 //检查字符是否相同
+#define STRING_ERROR(ret) \
+    do                    \
+    {                     \
+        c->top = head;    \
+        return ret;       \
+    } while (0)
 #define EXPECT(c, ch)             \
     do                            \
     {                             \
@@ -35,7 +40,12 @@ typedef struct
     char *stack;
     size_t size, top;
 } lept_context;
-
+#define STRING_ERROR(ret) \
+    do                    \
+    {                     \
+        c->top = head;    \
+        return ret;       \
+    } while (0)
 //入栈的逻辑如下：
 /*
 1.首先我们需要确保推入的字符大小本身大于0
@@ -101,6 +111,7 @@ static int lept_parse_literal(lept_context *c, lept_value *v, const char *litera
     v->type = type;
     return LEPT_PARSE_OK;
 }
+
 //对于解析数字逻辑分为以下几步：
 /*
 1.首先我们先需要判断首字符，我们首先得判断 '-'和'0' 两个字符，比方说'-1.xxx'或者'0.xxx'
@@ -157,7 +168,68 @@ static int lept_parse_number(lept_context *c, lept_value *v)
     c->json = p;
     return LEPT_PARSE_OK;
 }
+/*
+值得需要注意的是，当我们使用静态函数时，我们需要再使用他们之前就声明好。例如下面的例子可以看到，我们
+lept_parse_string中，要使用 lept_parse_hex4() 和 lept_encode_UTF-8(),两个函数，那么我们就首先需要在此之前声明，否则
+就会发生"function not declared in this scope 的报错"。
+A static function in C is a function that has a scope that is limited to its object file. This means that the static function is only visible in its object file.
+A function can be declared as static function by placing the static keyword before the function name.
+以下是例子：
+#include <stdio.h>
+static void staticFunc(void){
+   printf("Inside the static function staticFunc() ");
+}
 
+int main()
+{
+   staticFunc();
+   return 0;
+}
+*/
+static const char *lept_parse_hex4(const char *p, unsigned *u)
+{
+    int i;
+    *u = 0;
+    for (i = 0; i < 4; i++)
+    {
+        char ch = *p++;
+        *u <<= 4;
+        if (ch >= '0' && ch <= '9')
+            *u |= ch - '0';
+        else if (ch >= 'A' && ch <= 'F')
+            *u |= ch - ('A' - 10);
+        else if (ch >= 'a' && ch <= 'f')
+            *u |= ch - ('a' - 10);
+        else
+            return NULL;
+    }
+    return p;
+}
+
+static void lept_encode_utf8(lept_context *c, unsigned u)
+{
+    if (u <= 0x7F)
+        PUTC(c, u & 0xFF);
+    else if (u <= 0x7FF)
+    {
+        PUTC(c, 0xC0 | ((u >> 6) & 0xFF));
+        PUTC(c, 0x80 | (u & 0x3F));
+    }
+    else if (u <= 0xFFFF)
+    {
+        PUTC(c, 0xE0 | ((u >> 12) & 0xFF));
+        PUTC(c, 0x80 | ((u >> 6) & 0x3F));
+        PUTC(c, 0x80 | (u & 0x3F));
+    }
+    else
+    {
+        assert(u <= 0x10FFFF);
+        PUTC(c, 0xF0 | ((u >> 18) & 0xFF));
+        PUTC(c, 0x80 | ((u >> 12) & 0x3F));
+        PUTC(c, 0x80 | ((u >> 6) & 0x3F));
+        PUTC(c, 0x80 | (u & 0x3F));
+    }
+}
 //在解析字符串的过程中，首先要判断输入的文本是否是Json合法的字符串
 //根据Json对于字符串的定义，字符串首字符一定是“开头，所以先用EXPECT判断第一个字符
 //如果通过了，就对该输入字符串进行解析。
@@ -175,6 +247,11 @@ static int lept_parse_number(lept_context *c, lept_value *v)
 //如果遇'\0'就代表，字符串结束，但是整个字符串解析还没有结束，比如说's \0 d'，打印出来的字符串只有s而没有d，
 //如果上述条件都没有满足，那么就是其他任意字符，但对于任意字符，ASCII表上对于空白字符前的字符都定义为不合法
 //在确认字符合法之后，那么就可以把字符推入栈中
+
+//该函数用于读取输入字符串中前四位字符用于判断是否是十六进制数，0~FFFF
+//同时将Unique Code中16进制数字转化成10进制数字比如00A2对应的就是162
+// 002A
+//同时该函数最大的特点就是可以将十六进制字符串转化为十进制数字
 static int lept_parse_string(lept_context *c, lept_value *v)
 {
     size_t head = c->top, len;
@@ -219,32 +296,29 @@ static int lept_parse_string(lept_context *c, lept_value *v)
             case 't':
                 PUTC(c, '\t');
                 break;
-            /*
-            而对于 JSON字符串中的 \uXXXX 是以 16 进制表示码点 U+0000 至 U+FFFF，我们需要：
-            1.解析 4 位十六进制整数为码点，例如：00A2
-            2.由于字符串是以 UTF-8 存储，我们要把这个码点编码成 UTF-8。
-            4 位的 16 进制数字只能表示 0 至 0xFFFF，但之前我们说 UCS 的码点是从 0 至 0x10FFFF，那怎么能表示多出来的码点？
-            其实，U+0000 至 U+FFFF 这组 Unicode 字符称为基本多文种平面（basic multilingual plane, BMP），
-            还有另外 16 个平面。那么 BMP 以外的字符，JSON 会使用代理对（surrogate pair）表示 \uXXXX\uYYYY。在 BMP 中，保留了 2048 个代理码点。
-            如果第一个码点是 U+D800 至 U+DBFF，我们便知道它的代码对的高代理项（high surrogate），之后应该伴随一个 U+DC00 至 U+DFFF 的低代理项（low surrogate）。
-            然后，我们用下列公式把代理对 (H, L) 变换成真实的码点：
-                    codepoint = 0x10000 + (H − 0xD800) × 0x400 + (L − 0xDC00)
-                    H = 0xD834, L = 0xDD1E
-                    codepoint = 0x10000 + (H − 0xD800) × 0x400 + (L − 0xDC00)
-                    = 0x10000 + (0xD834 - 0xD800) × 0x400 + (0xDD1E − 0xDC00)
-                    = 0x10000 + 0x34 × 0x400 + 0x11E
-                    = 0x10000 + 0xD000 + 0x11E
-                    = 0x1D11E
-            这样就得出这转义序列的码点，然后我们再把它编码成 UTF-8。
-            如果只有高代理项而欠缺低代理项，或是低代理项不在合法码点范围，我们都返回 LEPT_PARSE_INVALID_UNICODE_SURROGATE 错误。
-            如果 \u 后不是 4 位十六进位数字，则返回LEPT_PARSE_INVALID_UNICODE_HEX 错误。
-            */
+                /*
+               而对于 JSON字符串中的 \uXXXX 是以 16 进制表示码点 U+0000 至 U+FFFF，我们需要：
+               1.解析 4 位十六进制整数为码点，例如：00A2
+               2.由于字符串是以 UTF-8 存储，我们要把这个码点编码成 UTF-8。
+               4 位的 16 进制数字只能表示 0 至 0xFFFF，但之前我们说 UCS 的码点是从 0 至 0x10FFFF，那怎么能表示多出来的码点？
+               其实，U+0000 至 U+FFFF 这组 Unicode 字符称为基本多文种平面（basic multilingual plane, BMP），
+               还有另外 16 个平面。那么 BMP 以外的字符，JSON 会使用代理对（surrogate pair）表示 \uXXXX\uYYYY。在 BMP 中，保留了 2048 个代理码点。
+               如果第一个码点是 U+D800 至 U+DBFF，我们便知道它的代码对的高代理项（high surrogate），之后应该伴随一个 U+DC00 至 U+DFFF 的低代理项（low surrogate）。
+               然后，我们用下列公式把代理对 (H, L) 变换成真实的码点：
+                       codepoint = 0x10000 + (H − 0xD800) × 0x400 + (L − 0xDC00)
+                       H = 0xD834, L = 0xDD1E
+                       codepoint = 0x10000 + (H − 0xD800) × 0x400 + (L − 0xDC00)
+                       = 0x10000 + (0xD834 - 0xD800) × 0x400 + (0xDD1E − 0xDC00)
+                       = 0x10000 + 0x34 × 0x400 + 0x11E
+                       = 0x10000 + 0xD000 + 0x11E
+                       = 0x1D11E
+               这样就得出这转义序列的码点，然后我们再把它编码成 UTF-8。
+               如果只有高代理项而欠缺低代理项，或是低代理项不在合法码点范围，我们都返回 LEPT_PARSE_INVALID_UNICODE_SURROGATE 错误。
+               如果 \u 后不是 4 位十六进位数字，则返回LEPT_PARSE_INVALID_UNICODE_HEX 错误。
+               */
             case 'u':
-                //检查 u后面是否是合法的16进制数字
                 if (!(p = lept_parse_hex4(p, &u)))
-                {
                     STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
-                }
                 //上述检查完了之后，我们就需要判断代理项，如00A2解析完之后就是162，就符合其中代理项的要求
                 // Surrogates are characters in the Unicode range U+D800—U+DFFF
                 //如果满足条件，我们就知道这是一个高代理项，那么随后应该伴随一个 U+DC00 至 U+DFFF 的低代理项（low surrogate)，当然也应该形如：\uxxxx
@@ -256,12 +330,10 @@ static int lept_parse_string(lept_context *c, lept_value *v)
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
                     if (*p++ != 'u')
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
-                    //此时判断遍历后面的低位项，判断是否在要求的范围中
                     if (!(p = lept_parse_hex4(p, &u2)))
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
                     if (u2 < 0xDC00 || u2 > 0xDFFF)
                         STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
-                    //计算最终码点
                     u = (((u - 0xD800) << 10) | (u2 - 0xDC00)) + 0x10000;
                 }
                 lept_encode_utf8(c, u);
@@ -306,7 +378,6 @@ int lept_parse(lept_value *v, const char *json)
     c.json = json;
     c.stack = NULL;
     c.size = c.top = 0;
-    //每次解析前，先初始化对象 赋一个初始NULL给数据类型
     lept_init(v);
     lept_parse_whitespace(&c);
     if ((ret = lept_parse_value(&c, v)) == LEPT_PARSE_OK)
@@ -390,54 +461,4 @@ void lept_set_string(lept_value *v, const char *s, size_t len)
     v->u.s.s[len] = '\0';
     v->u.s.len = len;
     v->type = LEPT_STRING;
-}
-
-//该函数用于读取输入字符串中前四位字符用于判断是否是十六进制数，0~FFFF
-//同时将Unique Code中16进制数字转化成10进制数字比如00A2对应的就是162
-// 002A
-//同时该函数最大的特点就是可以将十六进制字符串转化为十进制数字
-static const char *lept_parse_hex4(const char *p, unsigned *u)
-{
-    int i;
-    *u = 0;
-    for (i = 0; i < 4; i++)
-    {
-        char ch = *p++;
-        *u <<= 4;
-        // transform hex character to the 4bit equivalent number, using the ascii table indexes
-        if (ch >= '0' && ch <= '9')
-            *u |= ch - '0';
-        else if (ch >= 'A' && ch <= 'F')
-            *u |= ch - ('A' - 10);
-        else if (ch >= 'a' && ch <= 'f')
-            *u |= ch - ('a' - 10);
-        else
-            return NULL;
-    }
-    return p;
-}
-
-static void lept_encode_utf8(lept_context *c, unsigned u)
-{
-    if (u <= 0x7F)
-        PUTC(c, u & 0xFF);
-    else if (u <= 0x7FF)
-    {
-        PUTC(c, 0xC0 | ((u >> 6) & 0xFF));
-        PUTC(c, 0x80 | (u & 0x3F));
-    }
-    else if (u <= 0xFFFF)
-    {
-        PUTC(c, 0xE0 | ((u >> 12) & 0xFF));
-        PUTC(c, 0x80 | ((u >> 6) & 0x3F));
-        PUTC(c, 0x80 | (u & 0x3F));
-    }
-    else
-    {
-        assert(u <= 0x10FFFF);
-        PUTC(c, 0xF0 | ((u >> 18) & 0xFF));
-        PUTC(c, 0x80 | ((u >> 12) & 0x3F));
-        PUTC(c, 0x80 | ((u >> 6) & 0x3F));
-        PUTC(c, 0x80 | (u & 0x3F));
-    }
 }
