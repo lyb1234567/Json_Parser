@@ -8,6 +8,7 @@
 #include <math.h>   /* HUGE_VAL */
 #include <stdlib.h> /* NULL, malloc(), realloc(), free(), strtod() */
 #include <string.h> /* memcpy() */
+#include <stdio.h>
 #ifndef LEPT_PARSE_STACK_INIT_SIZE
 #define LEPT_PARSE_STACK_INIT_SIZE 256
 #endif
@@ -252,9 +253,9 @@ static void lept_encode_utf8(lept_context *c, unsigned u)
 //同时将Unique Code中16进制数字转化成10进制数字比如00A2对应的就是162
 // 002A
 //同时该函数最大的特点就是可以将十六进制字符串转化为十进制数字
-static int lept_parse_string(lept_context *c, lept_value *v)
+static int lept_parse_string_raw(lept_context *c, char **str, size_t *len)
 {
-    size_t head = c->top, len;
+    size_t head = c->top;
     unsigned u, u2;
     const char *p;
     EXPECT(c, '\"');
@@ -265,8 +266,8 @@ static int lept_parse_string(lept_context *c, lept_value *v)
         switch (ch)
         {
         case '\"':
-            len = c->top - head;
-            lept_set_string(v, (const char *)lept_context_pop(c, len), len);
+            *len = c->top - head;
+            *str = (char *)lept_context_pop(c, *len);
             c->json = p;
             return LEPT_PARSE_OK;
         case '\\':
@@ -351,6 +352,15 @@ static int lept_parse_string(lept_context *c, lept_value *v)
         }
     }
 }
+static int lept_parse_string(lept_context *c, lept_value *v)
+{
+    int ret;
+    char *s;
+    size_t len;
+    if ((ret = lept_parse_string_raw(c, &s, &len)) == LEPT_PARSE_OK)
+        lept_set_string(v, s, len);
+    return ret;
+}
 static int lept_parse_value(lept_context *c, lept_value *v)
 {
     switch (*c->json)
@@ -370,6 +380,160 @@ static int lept_parse_value(lept_context *c, lept_value *v)
     }
 }
 
+/*
+解析数组之前， 首先先判断是不是数组。标准就是第一个字符应为"["，
+然后就开始遍历输入的字符串，如果遇到了']',那么就代表解析结束，直接返回 LEPT_PARSE_OK，并将数组释放。
+遍历过程中，每遍历玩一个对象，将其推入栈中，比如解析完字符串"abc"之后，我们将abc推入栈中
+*/
+static int lept_parse_array(lept_context *c, lept_value *v)
+{
+    size_t i, size = 0;
+    int ret;
+    EXPECT(c, '[');
+    lept_parse_whitespace(c);
+    //空数组"[]"
+    if (*c->json == ']')
+    {
+        c->json++;
+        v->type = LEPT_ARRAY;
+        v->u.a.size = 0;
+        v->u.a.e = NULL;
+        return LEPT_PARSE_OK;
+    }
+    for (;;)
+    {
+        //首先先初始进行初始化，然后对方框后面的字符串进行解析，如果解析失败，那么数组就直接不需要解析。
+        lept_value e;
+        lept_init(&e);
+        if ((ret = lept_parse_value(c, &e)) != LEPT_PARSE_OK)
+            break;
+        //解析成功，就将解析成功的数组元素推入栈中
+        memcpy(lept_context_push(c, sizeof(lept_value)), &e, sizeof(lept_value));
+        size++;
+        lept_parse_whitespace(c);
+        if (*c->json == ',')
+        {
+            c->json++;
+            lept_parse_whitespace(c);
+        }
+        else if (*c->json == ']')
+        {
+            c->json++;
+            v->type = LEPT_ARRAY;
+            v->u.a.size = size;
+            size *= sizeof(lept_value);
+            memcpy(v->u.a.e = (lept_value *)malloc(size), lept_context_pop(c, size), size);
+            return LEPT_PARSE_OK;
+        }
+        else
+        {
+            ret = LEPT_PARSE_MISS_COMMA_OR_SQUARE_BRACKET;
+            break;
+        }
+    }
+    /* Pop and free values on the stack */
+    for (i = 0; i < size; i++)
+        lept_free((lept_value *)lept_context_pop(c, sizeof(lept_value)));
+    return ret;
+}
+/*
+        JSON key-value的形式是：
+        {
+        “StringProperty”: “StringValue”,
+        “NumberProperty”: 10,
+        “FloatProperty”: 20.13,
+        “BooleanProperty”: true,
+        “EmptyProperty”: null
+        }
+        所以当我们传入Json对象时，首先查看，是否是'{'，如果是就继续解析，如果不是，就会报错，所以按照惯例先用宏EXPECT判断首字符
+        戒指依旧是先遍历空白字符，如果直接遇到'}',那么说明是空对象，那么就代表解析成功，返回LEPT_PARSE_OK，同时将Value type赋成LEPT_OBJECT
+        将所有相关指针赋空，防止出现野指针。
+        如若不是空对象，那么就接着解析，解析之前，首先将成员的键以及大小赋空。接着就对{}中每个对象进行解析，这也就是递归的部分。
+
+        */
+static int lept_parse_object(lept_context *c, lept_value *v)
+{
+    size_t size;
+    lept_member m;
+    int ret;
+    EXPECT(c, '{');
+    lept_parse_whitespace(c);
+    if (*c->json == '}')
+    {
+        c->json++;
+        v->type = LEPT_OBJECT;
+        v->u.o.m = 0;
+        v->u.o.size = 0;
+        return LEPT_PARSE_OK;
+    }
+    m.k = NULL;
+    size = 0;
+    for (;;)
+    {
+        char *str;
+        lept_init(&m.v);
+        if (*c->json != '"')
+        {
+            ret = LEPT_PARSE_MISS_KEY;
+            break;
+        }
+        //接着就是解析key值，这其实就是解析字符串了。如果没有解析成功，那么就解析就直接结束。
+        if ((ret = lept_parse_string_raw(c, &str, &m.klen)) != LEPT_PARSE_OK)
+            break;
+        //把结果复制至 lept_member 的 k 和 klen 字段，记住末尾一定不要忘记'\0'符号
+        m.k = (char *)malloc(m.klen + 1);
+        memcpy(m.k, str, m.klen);
+        m.k[m.klen] = '\0';
+        //接下来就是解析值了,要处理冒号
+        lept_parse_whitespace(c);
+        if (*c->json != ':')
+        {
+            ret = LEPT_PARSE_MISS_COLON;
+            break;
+        }
+        c->json++;
+        lept_parse_whitespace(c);
+        if ((ret = lept_parse_value(c, &m.v)) != LEPT_PARSE_OK)
+            break;
+        //此时，成员m和赋值给栈中的成员
+        memcpy(lept_context_push(c, sizeof(lept_member)), &m, sizeof(lept_member));
+        //解析完成之后，{}花括号中的对象个数就+1
+        size++;
+        m.k = NULL;
+        lept_parse_whitespace(c);
+        if (*c->json == ',')
+        {
+            c->json++;
+            lept_parse_whitespace(c);
+        }
+        else if (*c->json == '}')
+        {
+            size_t s = sizeof(lept_member) * size;
+            c->json++;
+            v->type = LEPT_OBJECT;
+            v->u.o.size = size;
+            //将栈中整个{}内容弹出，并将它赋给v中对象的成员。
+            memcpy(v->u.o.m = (lept_member *)malloc(s), lept_context_pop(c, s), s);
+            return LEPT_PARSE_OK;
+        }
+        else
+        {
+            ret = LEPT_PARSE_MISS_COMMA_OR_CURLY_BRACKET;
+            break;
+        }
+    }
+    /* \todo Pop and free members on the stack */
+    free(m.k);
+    //将栈中对象逐个弹出，并逐一释放
+    for (int i = 0; i < size; i++)
+    {
+        lept_member *m = (lept_member *)lept_context_pop(c, sizeof(lept_member));
+        free(m->k);
+        lept_free(&m->v);
+    }
+    v->type = LEPT_NULL;
+    return ret;
+}
 int lept_parse(lept_value *v, const char *json)
 {
     lept_context c;
@@ -461,4 +625,35 @@ void lept_set_string(lept_value *v, const char *s, size_t len)
     v->u.s.s[len] = '\0';
     v->u.s.len = len;
     v->type = LEPT_STRING;
+}
+//按照惯例先检测数据类型是否是OBJECT类型，然后返回对象大小。
+size_t lept_get_object_size(const lept_value *v)
+{
+    assert(v != NULL && v->type == LEPT_OBJECT);
+    return v->u.o.size;
+}
+
+//首先判断是否是OBJECT对象，以及索引值是否会超过超过对象size大小
+//然后返回成员中的key
+const char *lept_get_object_key(const lept_value *v, size_t index)
+{
+    assert(v != NULL && v->type == LEPT_OBJECT);
+    assert(index < v->u.o.size);
+    return v->u.o.m[index].k;
+}
+//首先判断是否是OBJECT对象，以及索引值是否会超过超过对象size大小
+//然后返回成员中的key的长度
+size_t lept_get_object_key_length(const lept_value *v, size_t index)
+{
+    assert(v != NULL && v->type == LEPT_OBJECT);
+    assert(index < v->u.o.size);
+    return v->u.o.m[index].klen;
+}
+//首先判断是否是OBJECT对象，以及索引值是否会超过超过对象size大小
+//然后返回成员中的值
+lept_value *lept_get_object_value(const lept_value *v, size_t index)
+{
+    assert(v != NULL && v->type == LEPT_OBJECT);
+    assert(index < v->u.o.size);
+    return &v->u.o.m[index].v;
 }
